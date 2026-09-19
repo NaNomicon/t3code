@@ -47,7 +47,9 @@ const PROVIDER = ProviderDriverKind.make("omp");
 const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationError);
 const isProviderAdapterSessionNotFoundError = Schema.is(ProviderAdapterSessionNotFoundError);
 const ResumeCursor = (value: unknown): string | undefined =>
-  typeof value === "object" && value !== null && (value as { schemaVersion?: unknown }).schemaVersion === 1
+  typeof value === "object" &&
+  value !== null &&
+  (value as { schemaVersion?: unknown }).schemaVersion === 1
     ? typeof (value as { sessionId?: unknown }).sessionId === "string"
       ? (value as { sessionId: string }).sessionId
       : undefined
@@ -72,13 +74,18 @@ const normalizeOmpSessionUpdate = (
   const update = notification.update;
   // omp uses a thinking content block inside agent_message_chunk, while ACP's
   // parsed event model represents that stream as agent_thought_chunk.
-  const content = update.sessionUpdate === "agent_message_chunk"
-    ? update.content as unknown as { readonly type?: unknown; readonly text?: unknown }
-    : undefined;
+  const content =
+    update.sessionUpdate === "agent_message_chunk"
+      ? (update.content as unknown as { readonly type?: unknown; readonly text?: unknown })
+      : undefined;
   if (content?.type === "thinking" && typeof content.text === "string") {
     return {
       ...notification,
-      update: { ...update, sessionUpdate: "agent_thought_chunk", content: { type: "text", text: content.text } },
+      update: {
+        ...update,
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "text", text: content.text },
+      },
     } as EffectAcpSchema.SessionNotification;
   }
   return notification;
@@ -89,11 +96,12 @@ export function ompPermissionOptionId(
   decision: ProviderApprovalDecision,
 ): string | undefined {
   if (decision === "cancel") return undefined;
-  const hint = decision === "acceptForSession" || decision === "acceptAlways"
-    ? "always"
-    : decision === "accept"
-      ? "once"
-      : "reject";
+  const hint =
+    decision === "acceptForSession" || decision === "acceptAlways"
+      ? "always"
+      : decision === "accept"
+        ? "once"
+        : "reject";
   return options.find((option) => option.optionId.toLowerCase().includes(hint))?.optionId;
 }
 
@@ -102,10 +110,12 @@ export function ompModelsFromConfig(
 ): ReadonlyArray<{ readonly slug: string; readonly name: string }> {
   const model = options.find((option) => option.id === "model" || option.category === "model");
   if (model?.type !== "select") return [];
-  return model.options.flatMap((entry) => ("value" in entry ? [entry] : entry.options)).map((entry) => ({
-    slug: entry.value,
-    name: entry.name,
-  }));
+  return model.options
+    .flatMap((entry) => ("value" in entry ? [entry] : entry.options))
+    .map((entry) => ({
+      slug: entry.value,
+      name: entry.name,
+    }));
 }
 
 interface PendingPermission {
@@ -124,8 +134,16 @@ interface SessionContext {
   readonly session: ProviderSession;
   readonly permissions: Map<ApprovalRequestId, PendingPermission>;
   readonly turns: Array<{ readonly id: TurnId; readonly items: Array<unknown> }>;
-  activeTurnId?: TurnId;
-  prompt?: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
+  activeTurnId: TurnId | undefined;
+  prompt: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
+  generation: number;
+  stopped: boolean;
+}
+
+interface TurnIntent {
+  readonly turnId: TurnId;
+  readonly generation: number;
+  settled: boolean;
 }
 
 type Adapter = ProviderAdapterShape<ProviderAdapterError>;
@@ -149,9 +167,10 @@ export function mapOmpSessionUpdate(input: {
 }): ProviderRuntimeEvent | undefined {
   const update = input.update;
   if (
-    (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") &&
+    (update.sessionUpdate === "agent_message_chunk" ||
+      update.sessionUpdate === "agent_thought_chunk") &&
     update.content.type === "text" &&
-    update.content.text.length > 0
+    update.content.text.trim().length > 0
   ) {
     return makeAcpContentDeltaEvent({
       stamp: { eventId: input.eventId, createdAt: input.createdAt },
@@ -159,7 +178,9 @@ export function mapOmpSessionUpdate(input: {
       threadId: input.threadId,
       turnId: input.turnId,
       ...(input.itemId ? { itemId: input.itemId } : {}),
-      ...(update.sessionUpdate === "agent_thought_chunk" ? { streamKind: "reasoning_text" as const } : {}),
+      ...(update.sessionUpdate === "agent_thought_chunk"
+        ? { streamKind: "reasoning_text" as const }
+        : {}),
       text: update.content.text,
       rawPayload: update,
     });
@@ -172,7 +193,10 @@ export function mapOmpSessionUpdate(input: {
       ...(update.status != null
         ? { status: update.status === "in_progress" ? "inProgress" : update.status }
         : {}),
-      data: update.rawInput && typeof update.rawInput === "object" ? update.rawInput as Record<string, unknown> : {},
+      data:
+        update.rawInput && typeof update.rawInput === "object"
+          ? (update.rawInput as Record<string, unknown>)
+          : {},
     };
     return makeAcpToolCallEvent({
       stamp: { eventId: input.eventId, createdAt: input.createdAt },
@@ -191,7 +215,9 @@ export function mapOmpSessionUpdate(input: {
       provider: PROVIDER,
       threadId: input.threadId,
       ...(input.turnId ? { turnId: input.turnId } : {}),
-      payload: { usage: { usedTokens: Math.max(0, update.used), maxTokens: Math.max(1, update.size) } },
+      payload: {
+        usage: { usedTokens: Math.max(0, update.used), maxTokens: Math.max(1, update.size) },
+      },
       raw: { source: "acp.jsonrpc", method: "session/update", payload: update },
     };
   }
@@ -214,7 +240,9 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
         }),
     ),
   );
-  const requireSession = (threadId: ThreadId): Effect.Effect<SessionContext, ProviderAdapterSessionNotFoundError> => {
+  const requireSession = (
+    threadId: ThreadId,
+  ): Effect.Effect<SessionContext, ProviderAdapterSessionNotFoundError> => {
     const session = sessions.get(threadId);
     return session
       ? Effect.succeed(session)
@@ -223,6 +251,7 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
 
   const stop = (context: SessionContext) =>
     Effect.gen(function* () {
+      context.stopped = true;
       sessions.delete(context.threadId);
       for (const pending of context.permissions.values()) {
         yield* Deferred.succeed(pending.response, {
@@ -238,54 +267,73 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
   const startSession: Adapter["startSession"] = (input) =>
     Effect.gen(function* () {
       if (!input.cwd?.trim()) {
-        return yield* new ProviderAdapterValidationError({ provider: PROVIDER, operation: "startSession", issue: "The session requires a workspace directory." });
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "startSession",
+          issue: "The session requires a workspace directory.",
+        });
       }
       if (input.providerInstanceId && input.providerInstanceId !== options.instanceId) {
-        return yield* new ProviderAdapterValidationError({ provider: PROVIDER, operation: "startSession", issue: "The omp provider instance does not match the requested session." });
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "startSession",
+          issue: "The omp provider instance does not match the requested session.",
+        });
       }
       const previous = sessions.get(input.threadId);
       if (previous) yield* stop(previous);
       const scope = yield* Scope.make("sequential");
       const resumeSessionId = ResumeCursor(input.resumeCursor);
-      const spawn: AcpSessionRuntime.AcpSpawnInput = options.environment === undefined
-        ? { command: options.binaryPath || "omp", args: ["acp"], cwd: input.cwd }
-        : { command: options.binaryPath || "omp", args: ["acp"], cwd: input.cwd, env: options.environment };
-        const runtime = yield* AcpSessionRuntime.make({
+      const spawn: AcpSessionRuntime.AcpSpawnInput =
+        options.environment === undefined
+          ? { command: options.binaryPath || "omp", args: ["acp"], cwd: input.cwd }
+          : {
+              command: options.binaryPath || "omp",
+              args: ["acp"],
+              cwd: input.cwd,
+              env: options.environment,
+            };
+      const runtime = yield* AcpSessionRuntime.make({
         spawn,
         cwd: input.cwd,
         clientInfo: { name: "t3-code", version: "0.0.0" },
         authMethodId: "agent",
         ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
         resumeMethod: "load",
-          cancelBehavior: "wait-for-prompt",
-          transformSessionUpdate: normalizeOmpSessionUpdate,
-          }).pipe(
-          Effect.provideService(Scope.Scope, scope),
-          Effect.provideService(Crypto.Crypto, crypto),
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, options.childProcessSpawner),
-        );
+        cancelBehavior: "wait-for-prompt",
+        transformSessionUpdate: normalizeOmpSessionUpdate,
+      }).pipe(
+        Effect.provideService(Scope.Scope, scope),
+        Effect.provideService(Crypto.Crypto, crypto),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, options.childProcessSpawner),
+      );
       const pending = new Map<ApprovalRequestId, PendingPermission>();
       let context: SessionContext | undefined;
       yield* runtime.handleRequestPermission((request) => {
         if (!context) return Effect.succeed({ outcome: { outcome: "cancelled" } });
         const activeContext = context;
         return Effect.gen(function* () {
-          const requestId = ApprovalRequestId.make(yield* crypto.randomUUIDv4.pipe(
-            Effect.mapError((cause) => EffectAcpErrors.AcpRequestError.internalError(
-              "Could not create an omp permission request id.",
-              undefined,
-              { cause },
-            )),
-          ));
-            const response = yield* Deferred.make<{
-              readonly decision: ProviderApprovalDecision;
-              readonly result: EffectAcpSchema.RequestPermissionResponse;
-            }>();
+          const requestId = ApprovalRequestId.make(
+            yield* crypto.randomUUIDv4.pipe(
+              Effect.mapError((cause) =>
+                EffectAcpErrors.AcpRequestError.internalError(
+                  "Could not create an omp permission request id.",
+                  undefined,
+                  { cause },
+                ),
+              ),
+            ),
+          );
+          const response = yield* Deferred.make<{
+            readonly decision: ProviderApprovalDecision;
+            readonly result: EffectAcpSchema.RequestPermissionResponse;
+          }>();
           pending.set(requestId, { request, response });
           const stamp = { eventId: yield* id, createdAt: yield* now };
           const parsed = parsePermissionRequest(request);
-            const runtimeRequestId = RuntimeRequestId.make(requestId);
-            yield* emit(makeAcpRequestOpenedEvent({
+          const runtimeRequestId = RuntimeRequestId.make(requestId);
+          yield* emit(
+            makeAcpRequestOpenedEvent({
               stamp,
               provider: PROVIDER,
               threadId: input.threadId,
@@ -297,199 +345,315 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
               source: "acp.jsonrpc",
               method: "session/request_permission",
               rawPayload: request,
-            }));
-              const answer = yield* Deferred.await(response).pipe(
-                Effect.tap((answer) =>
-                Effect.gen(function* () {
-                  yield* emit(makeAcpRequestResolvedEvent({
+            }),
+          );
+          const answer = yield* Deferred.await(response).pipe(
+            Effect.tap((answer) =>
+              Effect.gen(function* () {
+                yield* emit(
+                  makeAcpRequestResolvedEvent({
                     stamp: { eventId: yield* id, createdAt: yield* now },
                     provider: PROVIDER,
                     threadId: input.threadId,
                     turnId: activeContext.activeTurnId,
                     requestId: runtimeRequestId,
                     permissionRequest: parsed,
-                      decision: answer.decision,
-                  }));
-                }),
-              ),
-                Effect.ensuring(Effect.sync(() => pending.delete(requestId))),
-              );
-              return answer.result;
+                    decision: answer.decision,
+                  }),
+                );
+              }),
+            ),
+            Effect.ensuring(Effect.sync(() => pending.delete(requestId))),
+          );
+          return answer.result;
         });
       });
       const started = yield* runtime.start();
       if (started.sessionSetupResult.configOptions) {
-        yield* options.onConfigOptionsUpdated?.(started.sessionSetupResult.configOptions) ?? Effect.void;
+        yield* (
+          options.onConfigOptionsUpdated?.(started.sessionSetupResult.configOptions) ?? Effect.void
+        );
       }
       const createdAt = yield* now;
       const session: ProviderSession = {
-        provider: PROVIDER, providerInstanceId: options.instanceId, threadId: input.threadId,
-        cwd: input.cwd, status: "ready", runtimeMode: input.runtimeMode, createdAt, updatedAt: createdAt,
+        provider: PROVIDER,
+        providerInstanceId: options.instanceId,
+        threadId: input.threadId,
+        cwd: input.cwd,
+        status: "ready",
+        runtimeMode: input.runtimeMode,
+        createdAt,
+        updatedAt: createdAt,
         resumeCursor: { schemaVersion: 1, sessionId: started.sessionId },
         ...(started.modelConfigId ? { model: started.modelConfigId } : {}),
       };
-        context = {
-          threadId: input.threadId,
-          runtime,
-          scope,
-          sessionId: started.sessionId,
-          session,
-          permissions: pending,
-          turns: [],
-        };
+      context = {
+        threadId: input.threadId,
+        runtime,
+        scope,
+        sessionId: started.sessionId,
+        session,
+        activeTurnId: undefined,
+        prompt: undefined,
+        permissions: pending,
+        turns: [],
+        generation: 0,
+        stopped: false,
+      };
       sessions.set(input.threadId, context);
-        yield* Stream.runForEach(runtime.getEvents(), (event) => {
-          if (event._tag === "AssistantItemStarted" || event._tag === "AssistantItemCompleted") {
-            return Effect.gen(function* () {
-              yield* emit(makeAcpAssistantItemEvent({
+      yield* Stream.runForEach(runtime.getEvents(), (event) => {
+        if (event._tag === "AssistantItemStarted" || event._tag === "AssistantItemCompleted") {
+          return Effect.gen(function* () {
+            yield* emit(
+              makeAcpAssistantItemEvent({
                 stamp: { eventId: yield* id, createdAt: yield* now },
                 provider: PROVIDER,
                 threadId: input.threadId,
                 turnId: context?.activeTurnId,
                 itemId: event.itemId,
-                lifecycle: event._tag === "AssistantItemStarted" ? "item.started" : "item.completed",
-              }));
+                lifecycle:
+                  event._tag === "AssistantItemStarted" ? "item.started" : "item.completed",
+              }),
+            );
+          });
+        }
+        if (event._tag === "ConfigOptionsUpdated") {
+          return options.onConfigOptionsUpdated?.(event.configOptions) ?? Effect.void;
+        }
+        if (event._tag === "AvailableCommandsUpdated") {
+          return options.onAvailableCommands?.(event.availableCommands) ?? Effect.void;
+        }
+        if (event._tag === "ConnectionTerminated") {
+          return Effect.gen(function* () {
+            const stamp = { eventId: yield* id, createdAt: yield* now };
+            yield* emit({
+              type: "session.state.changed",
+              ...stamp,
+              provider: PROVIDER,
+              threadId: input.threadId,
+              payload: { state: "error", reason: event.error.message },
             });
+          });
+        }
+        if (event._tag === "EventStreamBarrier") {
+          return Deferred.succeed(event.acknowledge, undefined);
+        }
+        if (
+          event._tag === "ContentDelta" ||
+          event._tag === "ThoughtDelta" ||
+          event._tag === "ToolCallUpdated" ||
+          event._tag === "UsageUpdated"
+        ) {
+          if (
+            (event._tag === "ContentDelta" || event._tag === "ThoughtDelta") &&
+            !event.text?.trim()
+          ) {
+            return Effect.void;
           }
-          if (event._tag === "ConfigOptionsUpdated") {
-            return options.onConfigOptionsUpdated?.(event.configOptions) ?? Effect.void;
-          }
-          if (event._tag === "AvailableCommandsUpdated") {
-            return options.onAvailableCommands?.(event.availableCommands) ?? Effect.void;
-          }
-          if (event._tag === "ConnectionTerminated") {
-            return Effect.gen(function* () {
-              const stamp = { eventId: yield* id, createdAt: yield* now };
-              yield* emit({
-                type: "session.state.changed",
-                ...stamp,
-                provider: PROVIDER,
-                threadId: input.threadId,
-                payload: { state: "error", reason: event.error.message },
-              });
-            });
-          }
-          if (event._tag === "EventStreamBarrier") {
-            return Deferred.succeed(event.acknowledge, undefined);
-          }
-          if (event._tag === "ContentDelta" || event._tag === "ThoughtDelta" || event._tag === "ToolCallUpdated" || event._tag === "UsageUpdated") {
-            return Effect.gen(function* () {
-              const update = event._tag === "ContentDelta"
-                ? { sessionUpdate: "agent_message_chunk", content: { type: "text", text: event.text } }
+          return Effect.gen(function* () {
+            const update =
+              event._tag === "ContentDelta"
+                ? {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: event.text },
+                  }
                 : event._tag === "ThoughtDelta"
-                  ? { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: event.text } }
-                : event._tag === "UsageUpdated"
-                ? { sessionUpdate: "usage_update", used: event.used, size: event.size }
-              : {
-                  sessionUpdate: "tool_call_update",
-                  toolCallId: event.toolCall.toolCallId,
-                  ...(event.toolCall.title != null ? { title: event.toolCall.title } : {}),
-                  ...(event.toolCall.kind != null ? { kind: event.toolCall.kind } : {}),
-                  ...(event.toolCall.status != null ? { status: event.toolCall.status } : {}),
-                  rawInput: event.toolCall.data,
-                };
-              const mapped = mapOmpSessionUpdate({
-                threadId: input.threadId,
-                ...(context?.activeTurnId ? { turnId: context.activeTurnId } : {}),
-                ...(event._tag === "ContentDelta" && event.itemId ? { itemId: event.itemId } : {}),
-                update: update as never,
-                eventId: yield* id,
-                createdAt: yield* now,
-              });
+                  ? {
+                      sessionUpdate: "agent_thought_chunk",
+                      content: { type: "text", text: event.text },
+                    }
+                  : event._tag === "UsageUpdated"
+                    ? { sessionUpdate: "usage_update", used: event.used, size: event.size }
+                    : {
+                        sessionUpdate: "tool_call_update",
+                        toolCallId: event.toolCall.toolCallId,
+                        ...(event.toolCall.title != null ? { title: event.toolCall.title } : {}),
+                        ...(event.toolCall.kind != null ? { kind: event.toolCall.kind } : {}),
+                        ...(event.toolCall.status != null ? { status: event.toolCall.status } : {}),
+                        rawInput: event.toolCall.data,
+                      };
+            const mapped = mapOmpSessionUpdate({
+              threadId: input.threadId,
+              ...(context?.activeTurnId ? { turnId: context.activeTurnId } : {}),
+              ...(event._tag === "ContentDelta" && event.itemId ? { itemId: event.itemId } : {}),
+              update: update as never,
+              eventId: yield* id,
+              createdAt: yield* now,
+            });
             if (mapped) yield* emit(mapped);
           });
         }
         return Effect.void;
       }).pipe(Effect.forkIn(scope));
       return session;
-    }).pipe(Effect.mapError((cause) => isProviderAdapterValidationError(cause) || isProviderAdapterSessionNotFoundError(cause) ? cause : error(input.threadId, "session/new", cause)));
+    }).pipe(
+      Effect.mapError((cause) =>
+        isProviderAdapterValidationError(cause) || isProviderAdapterSessionNotFoundError(cause)
+          ? cause
+          : error(input.threadId, "session/new", cause),
+      ),
+    );
 
   const sendTurn: Adapter["sendTurn"] = (input: ProviderSendTurnInput) =>
     Effect.gen(function* () {
       const context = yield* requireSession(input.threadId);
-      if (!input.input?.trim()) return yield* new ProviderAdapterValidationError({ provider: PROVIDER, operation: "sendTurn", issue: "omp requires a non-empty prompt." });
+      if (!input.input?.trim()) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "sendTurn",
+          issue: "omp requires a non-empty prompt.",
+        });
+      }
+      const promptText = input.input.trim();
       const turnId = TurnId.make(yield* crypto.randomUUIDv4);
+      const turn: TurnIntent = { turnId, generation: ++context.generation, settled: false };
+      let promptFiber:
+        | Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>
+        | undefined;
+      const finishTurn = (payload: {
+        readonly state: "cancelled" | "completed" | "failed";
+        readonly stopReason?: string;
+        readonly errorMessage?: string;
+      }) =>
+        Effect.gen(function* () {
+          if (turn.settled || context.stopped || context.generation !== turn.generation) return;
+          turn.settled = true;
+          if (context.activeTurnId === turn.turnId) context.activeTurnId = undefined;
+          if (context.prompt === promptFiber) context.prompt = undefined;
+          const finishedId = yield* id;
+          const finishedAt = yield* now;
+          yield* emit({
+            type: "turn.completed",
+            eventId: finishedId,
+            createdAt: finishedAt,
+            provider: PROVIDER,
+            threadId: input.threadId,
+            turnId,
+            payload,
+          });
+        }).pipe(Effect.uninterruptible);
+
       context.activeTurnId = turnId;
-      const prompt = yield* context.runtime.prompt({ prompt: [{ type: "text", text: input.input }] }).pipe(Effect.forkIn(context.scope));
-      context.prompt = prompt;
-      const startedEventId = yield* id;
-      const startedAt = yield* now;
-      yield* emit({
-        type: "turn.started",
-        eventId: startedEventId,
-        createdAt: startedAt,
-        provider: PROVIDER,
-        threadId: input.threadId,
-        turnId,
-        payload: {},
-      });
-        yield* Fiber.await(prompt).pipe(
-          Effect.flatMap((exit) =>
-            Effect.gen(function* () {
-              yield* context.runtime.drainEvents;
-              const finishedId = yield* id;
-              const finishedAt = yield* now;
-              context.turns.push({ id: turnId, items: [] });
-              return Exit.match(exit, {
-              onSuccess: (response) =>
-                emit({
-                  type: "turn.completed",
-                  eventId: finishedId,
-                  createdAt: finishedAt,
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                  turnId,
-                  payload: {
-                    state: response.stopReason === "cancelled" ? ("cancelled" as const) : ("completed" as const),
-                    ...(response.stopReason != null ? { stopReason: response.stopReason } : {}),
-                  },
-                }),
-              onFailure: (cause) =>
-                emit({
-                  type: "turn.completed",
-                  eventId: finishedId,
-                  createdAt: finishedAt,
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                  turnId,
-                  payload: { state: "failed" as const, errorMessage: String(cause) },
-                }),
-            });
+      return yield* Effect.gen(function* () {
+        const startedEventId = yield* id;
+        const startedAt = yield* now;
+        yield* emit({
+          type: "turn.started",
+          eventId: startedEventId,
+          createdAt: startedAt,
+          provider: PROVIDER,
+          threadId: input.threadId,
+          turnId,
+          payload: {},
+        });
+        const dispatched = yield* Deferred.make<void>();
+        promptFiber = yield* context.runtime
+          .prompt({ prompt: [{ type: "text", text: promptText }] }, { dispatched })
+          .pipe(Effect.forkIn(context.scope));
+        context.prompt = promptFiber;
+        yield* Effect.raceFirst(
+          Deferred.await(dispatched),
+          Fiber.await(promptFiber).pipe(
+            Effect.flatMap((exit) => exit),
+            Effect.asVoid,
+          ),
+        );
+        const response = yield* Fiber.await(promptFiber).pipe(Effect.flatMap((exit) => exit));
+        yield* context.runtime.drainEvents;
+        context.turns.push({ id: turnId, items: [] });
+        yield* finishTurn({
+          state: response.stopReason === "cancelled" ? "cancelled" : "completed",
+          ...(response.stopReason != null ? { stopReason: response.stopReason } : {}),
+        });
+        return { threadId: input.threadId, turnId, resumeCursor: context.session.resumeCursor };
+      }).pipe(
+        Effect.tapError((cause) => finishTurn({ state: "failed", errorMessage: String(cause) })),
+        Effect.onInterrupt(() =>
+          Effect.gen(function* () {
+            yield* Effect.ignore(context.runtime.cancel);
+            if (promptFiber) yield* Fiber.interrupt(promptFiber);
+            yield* finishTurn({ state: "cancelled", stopReason: "cancelled" });
           }),
         ),
-        Effect.ignore,
-        Effect.forkIn(context.scope),
       );
-      return { threadId: input.threadId, turnId, resumeCursor: context.session.resumeCursor };
-    }).pipe(Effect.mapError((cause) => isProviderAdapterValidationError(cause) ? cause : error(input.threadId, "session/prompt", cause)));
+    }).pipe(
+      Effect.mapError((cause) =>
+        isProviderAdapterValidationError(cause)
+          ? cause
+          : error(input.threadId, "session/prompt", cause),
+      ),
+    );
 
-    const respondToRequest: Adapter["respondToRequest"] = (threadId, requestId, decision) =>
+  const respondToRequest: Adapter["respondToRequest"] = (threadId, requestId, decision) =>
     Effect.gen(function* () {
       const context = yield* requireSession(threadId);
       const pending = context.permissions.get(requestId);
-      if (!pending) return yield* new ProviderAdapterRequestError({ provider: PROVIDER, method: "session/request_permission", detail: "This approval request is no longer pending." });
+      if (!pending)
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "session/request_permission",
+          detail: "This approval request is no longer pending.",
+        });
       const optionId = ompPermissionOptionId(pending.request.options, decision);
       if (decision !== "cancel" && optionId === undefined) {
-        return yield* new ProviderAdapterValidationError({ provider: PROVIDER, operation: "respondToRequest", issue: "omp did not offer this permission choice." });
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "respondToRequest",
+          issue: "omp did not offer this permission choice.",
+        });
       }
       const option = optionId ? { optionId } : undefined;
-        yield* Deferred.succeed(pending.response, {
-          decision,
-          result: { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } },
-        });
+      yield* Deferred.succeed(pending.response, {
+        decision,
+        result: {
+          outcome: option
+            ? { outcome: "selected", optionId: option.optionId }
+            : { outcome: "cancelled" },
+        },
+      });
     });
-  const interruptTurn: Adapter["interruptTurn"] = (threadId) => requireSession(threadId).pipe(Effect.flatMap((context) => context.runtime.cancel), Effect.mapError((cause) => error(threadId, "session/cancel", cause)));
-  const respondToUserInput: Adapter["respondToUserInput"] = () => Effect.fail(new ProviderAdapterValidationError({ provider: PROVIDER, operation: "respondToUserInput", issue: "omp does not expose structured user questions." }));
-  const stopSession: Adapter["stopSession"] = (threadId) => requireSession(threadId).pipe(Effect.flatMap(stop));
-  yield* Effect.addFinalizer(() => Effect.forEach([...sessions.values()], stop, { discard: true }).pipe(Effect.andThen(PubSub.shutdown(events))));
+  const interruptTurn: Adapter["interruptTurn"] = (threadId) =>
+    requireSession(threadId).pipe(
+      Effect.flatMap((context) => context.runtime.cancel),
+      Effect.mapError((cause) => error(threadId, "session/cancel", cause)),
+    );
+  const respondToUserInput: Adapter["respondToUserInput"] = () =>
+    Effect.fail(
+      new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "respondToUserInput",
+        issue: "omp does not expose structured user questions.",
+      }),
+    );
+  const stopSession: Adapter["stopSession"] = (threadId) =>
+    requireSession(threadId).pipe(Effect.flatMap(stop));
+  yield* Effect.addFinalizer(() =>
+    Effect.forEach([...sessions.values()], stop, { discard: true }).pipe(
+      Effect.andThen(PubSub.shutdown(events)),
+    ),
+  );
   return {
-    provider: PROVIDER, capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
-    startSession, sendTurn, interruptTurn, respondToRequest, respondToUserInput, stopSession,
+    provider: PROVIDER,
+    capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+    startSession,
+    sendTurn,
+    interruptTurn,
+    respondToRequest,
+    respondToUserInput,
+    stopSession,
     stopAll: () => Effect.forEach([...sessions.values()], stop, { discard: true }),
     listSessions: () => Effect.succeed([...sessions.values()].map(({ session }) => session)),
     hasSession: (threadId) => Effect.succeed(sessions.has(threadId)),
-      readThread: (threadId) => requireSession(threadId).pipe(Effect.map((context) => ({ threadId, turns: context.turns }))),
-    rollbackThread: () => Effect.fail(new ProviderAdapterValidationError({ provider: PROVIDER, operation: "rollbackThread", issue: "omp does not support conversation rewind." })),
+    readThread: (threadId) =>
+      requireSession(threadId).pipe(Effect.map((context) => ({ threadId, turns: context.turns }))),
+    rollbackThread: () =>
+      Effect.fail(
+        new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "omp does not support conversation rewind.",
+        }),
+      ),
     streamEvents: Stream.fromPubSub(events),
   } satisfies Adapter;
 });
