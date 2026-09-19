@@ -286,6 +286,52 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
       context.activeTurnId = turnId;
       const prompt = yield* context.runtime.prompt({ prompt: [{ type: "text", text: input.input }] }).pipe(Effect.forkIn(context.scope));
       context.prompt = prompt;
+      const startedEventId = yield* id;
+      const startedAt = yield* now;
+      yield* emit({
+        type: "turn.started",
+        eventId: startedEventId,
+        createdAt: startedAt,
+        provider: PROVIDER,
+        threadId: input.threadId,
+        turnId,
+        payload: {},
+      });
+      yield* Fiber.await(prompt).pipe(
+        Effect.flatMap((exit) =>
+          Effect.gen(function* () {
+            const finishedId = yield* id;
+            const finishedAt = yield* now;
+            return Exit.match(exit, {
+              onSuccess: (response) =>
+                emit({
+                  type: "turn.completed",
+                  eventId: finishedId,
+                  createdAt: finishedAt,
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  turnId,
+                  payload: {
+                    state: response.stopReason === "cancelled" ? ("cancelled" as const) : ("completed" as const),
+                    ...(response.stopReason != null ? { stopReason: response.stopReason } : {}),
+                  },
+                }),
+              onFailure: (cause) =>
+                emit({
+                  type: "turn.completed",
+                  eventId: finishedId,
+                  createdAt: finishedAt,
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  turnId,
+                  payload: { state: "failed" as const, errorMessage: String(cause) },
+                }),
+            });
+          }),
+        ),
+        Effect.ignore,
+        Effect.forkIn(context.scope),
+      );
       return { threadId: input.threadId, turnId, resumeCursor: context.session.resumeCursor };
     }).pipe(Effect.mapError((cause) => isProviderAdapterValidationError(cause) ? cause : error(input.threadId, "session/prompt", cause)));
 
