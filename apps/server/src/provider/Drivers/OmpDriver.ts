@@ -3,17 +3,20 @@ import {
   ProviderDriverKind,
   TextGenerationError,
   type ServerProvider,
+  type ServerProviderModel,
+  type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import type * as TextGeneration from "../../textGeneration/TextGeneration.ts";
-import { makeOmpAdapter } from "../Layers/OmpAdapter.ts";
+import { makeOmpAdapter, ompModelsFromConfig } from "../Layers/OmpAdapter.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import type { ProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
@@ -24,6 +27,29 @@ import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment
 const DRIVER_KIND = ProviderDriverKind.make("omp");
 const decodeSettings = Schema.decodeSync(OmpSettings);
 const EMPTY_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
+
+const serverModelsFromConfig = (
+  options: ReadonlyArray<import("effect-acp/schema").SessionConfigOption>,
+): ReadonlyArray<ServerProviderModel> =>
+  ompModelsFromConfig(options).map((model) => ({
+    ...model,
+    isCustom: false,
+    capabilities: EMPTY_CAPABILITIES,
+  }));
+
+const serverCommandsFromAcp = (
+  commands: ReadonlyArray<import("effect-acp/schema").AvailableCommand>,
+): ReadonlyArray<ServerProviderSlashCommand> => {
+  const seen = new Set<string>();
+  return commands.flatMap((command) => {
+    const name = command.name.trim();
+    if (!name || seen.has(name)) return [];
+    seen.add(name);
+    const description = command.description.trim();
+    const hint = command.input?.hint.trim();
+    return [{ name, ...(description ? { description } : {}), ...(hint ? { input: { hint } } : {}) }];
+  });
+};
 
 export type OmpDriverEnv = ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto;
 
@@ -67,12 +93,26 @@ export const OmpDriver: ProviderDriver<OmpSettings, OmpDriverEnv> = {
         supportsTextGeneration: false,
         message: settings.enabled ? "oh-my-pi ACP is ready to start." : "oh-my-pi is disabled in provider settings.",
       });
-      const adapter = yield* makeOmpAdapter({ instanceId, binaryPath: settings.binaryPath, environment: mergeProviderInstanceEnvironment(environment), childProcessSpawner: spawner });
-      const providerShape: ServerProviderShape = {
-        resolveMaintenance: () => Effect.succeed(makeManualOnlyProviderMaintenanceCapabilities({ provider: DRIVER_KIND, packageName: "@oh-my-pi/pi-coding-agent" })),
-        getSnapshot: Effect.succeed(snapshot),
-        refresh: Effect.succeed(snapshot),
-        streamChanges: Stream.empty,
+        const metadata = yield* SubscriptionRef.make(snapshot);
+        const adapter = yield* makeOmpAdapter({
+          instanceId,
+          binaryPath: settings.binaryPath,
+          environment: mergeProviderInstanceEnvironment(environment),
+          childProcessSpawner: spawner,
+          onConfigOptionsUpdated: (options) => SubscriptionRef.update(metadata, (current) => ({
+            ...current,
+            models: serverModelsFromConfig(options),
+          })),
+          onAvailableCommands: (commands) => SubscriptionRef.update(metadata, (current) => ({
+            ...current,
+            slashCommands: serverCommandsFromAcp(commands),
+          })),
+        });
+        const providerShape: ServerProviderShape = {
+          resolveMaintenance: () => Effect.succeed(makeManualOnlyProviderMaintenanceCapabilities({ provider: DRIVER_KIND, packageName: "@oh-my-pi/pi-coding-agent" })),
+          getSnapshot: SubscriptionRef.get(metadata),
+          refresh: SubscriptionRef.get(metadata),
+          streamChanges: SubscriptionRef.changes(metadata),
         applyUsageLimits: () => Effect.void,
       };
       return {

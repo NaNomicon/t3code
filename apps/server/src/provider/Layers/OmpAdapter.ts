@@ -33,7 +33,13 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
-import { makeAcpContentDeltaEvent, makeAcpToolCallEvent } from "../acp/AcpCoreRuntimeEvents.ts";
+import {
+  makeAcpAssistantItemEvent,
+  makeAcpContentDeltaEvent,
+  makeAcpRequestOpenedEvent,
+  makeAcpRequestResolvedEvent,
+  makeAcpToolCallEvent,
+} from "../acp/AcpCoreRuntimeEvents.ts";
 import { parsePermissionRequest, type AcpToolCallState } from "../acp/AcpRuntimeModel.ts";
 import * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 
@@ -52,14 +58,42 @@ export interface OmpAdapterOptions {
   readonly binaryPath: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly childProcessSpawner: import("effect/unstable/process/ChildProcessSpawner").ChildProcessSpawner["Service"];
+  readonly onConfigOptionsUpdated?: (
+    options: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+  ) => Effect.Effect<void>;
+  readonly onAvailableCommands?: (
+    commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+  ) => Effect.Effect<void>;
 }
+
+const normalizeOmpSessionUpdate = (
+  notification: EffectAcpSchema.SessionNotification,
+): EffectAcpSchema.SessionNotification => {
+  const update = notification.update;
+  // omp uses a thinking content block inside agent_message_chunk, while ACP's
+  // parsed event model represents that stream as agent_thought_chunk.
+  const content = update.sessionUpdate === "agent_message_chunk"
+    ? update.content as unknown as { readonly type?: unknown; readonly text?: unknown }
+    : undefined;
+  if (content?.type === "thinking" && typeof content.text === "string") {
+    return {
+      ...notification,
+      update: { ...update, sessionUpdate: "agent_thought_chunk", content: { type: "text", text: content.text } },
+    } as EffectAcpSchema.SessionNotification;
+  }
+  return notification;
+};
 
 export function ompPermissionOptionId(
   options: ReadonlyArray<EffectAcpSchema.PermissionOption>,
   decision: ProviderApprovalDecision,
 ): string | undefined {
   if (decision === "cancel") return undefined;
-  const hint = decision === "acceptForSession" ? "always" : decision === "accept" ? "once" : "reject";
+  const hint = decision === "acceptForSession" || decision === "acceptAlways"
+    ? "always"
+    : decision === "accept"
+      ? "once"
+      : "reject";
   return options.find((option) => option.optionId.toLowerCase().includes(hint))?.optionId;
 }
 
@@ -76,7 +110,10 @@ export function ompModelsFromConfig(
 
 interface PendingPermission {
   readonly request: EffectAcpSchema.RequestPermissionRequest;
-  readonly response: Deferred.Deferred<EffectAcpSchema.RequestPermissionResponse>;
+  readonly response: Deferred.Deferred<{
+    readonly decision: ProviderApprovalDecision;
+    readonly result: EffectAcpSchema.RequestPermissionResponse;
+  }>;
 }
 
 interface SessionContext {
@@ -86,6 +123,7 @@ interface SessionContext {
   readonly sessionId: string;
   readonly session: ProviderSession;
   readonly permissions: Map<ApprovalRequestId, PendingPermission>;
+  readonly turns: Array<{ readonly id: TurnId; readonly items: Array<unknown> }>;
   activeTurnId?: TurnId;
   prompt?: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
 }
@@ -107,14 +145,21 @@ export function mapOmpSessionUpdate(input: {
   readonly update: EffectAcpSchema.SessionNotification["update"];
   readonly eventId: EventId;
   readonly createdAt: string;
+  readonly itemId?: string;
 }): ProviderRuntimeEvent | undefined {
   const update = input.update;
-  if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+  if (
+    (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") &&
+    update.content.type === "text" &&
+    update.content.text.length > 0
+  ) {
     return makeAcpContentDeltaEvent({
       stamp: { eventId: input.eventId, createdAt: input.createdAt },
       provider: PROVIDER,
       threadId: input.threadId,
       turnId: input.turnId,
+      ...(input.itemId ? { itemId: input.itemId } : {}),
+      ...(update.sessionUpdate === "agent_thought_chunk" ? { streamKind: "reasoning_text" as const } : {}),
       text: update.content.text,
       rawPayload: update,
     });
@@ -179,6 +224,13 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
   const stop = (context: SessionContext) =>
     Effect.gen(function* () {
       sessions.delete(context.threadId);
+      for (const pending of context.permissions.values()) {
+        yield* Deferred.succeed(pending.response, {
+          decision: "cancel",
+          result: { outcome: { outcome: "cancelled" } },
+        });
+      }
+      context.permissions.clear();
       if (context.prompt) yield* Effect.ignore(context.runtime.cancel);
       yield* Scope.close(context.scope, Exit.void);
     });
@@ -198,15 +250,16 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
       const spawn: AcpSessionRuntime.AcpSpawnInput = options.environment === undefined
         ? { command: options.binaryPath || "omp", args: ["acp"], cwd: input.cwd }
         : { command: options.binaryPath || "omp", args: ["acp"], cwd: input.cwd, env: options.environment };
-      const runtime = yield* AcpSessionRuntime.make({
+        const runtime = yield* AcpSessionRuntime.make({
         spawn,
         cwd: input.cwd,
         clientInfo: { name: "t3-code", version: "0.0.0" },
         authMethodId: "agent",
         ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
         resumeMethod: "load",
-        cancelBehavior: "wait-for-prompt",
-        }).pipe(
+          cancelBehavior: "wait-for-prompt",
+          transformSessionUpdate: normalizeOmpSessionUpdate,
+          }).pipe(
           Effect.provideService(Scope.Scope, scope),
           Effect.provideService(Crypto.Crypto, crypto),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, options.childProcessSpawner),
@@ -224,21 +277,50 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
               { cause },
             )),
           ));
-          const response = yield* Deferred.make<EffectAcpSchema.RequestPermissionResponse>();
+            const response = yield* Deferred.make<{
+              readonly decision: ProviderApprovalDecision;
+              readonly result: EffectAcpSchema.RequestPermissionResponse;
+            }>();
           pending.set(requestId, { request, response });
           const stamp = { eventId: yield* id, createdAt: yield* now };
           const parsed = parsePermissionRequest(request);
-          yield* emit({
-            type: "request.opened", ...stamp, provider: PROVIDER, threadId: input.threadId,
-            ...(activeContext.activeTurnId ? { turnId: activeContext.activeTurnId } : {}),
-            requestId: RuntimeRequestId.make(requestId),
-            payload: { requestType: "dynamic_tool_call", detail: parsed.detail ?? "omp requests permission.", args: request },
-            raw: { source: "acp.jsonrpc", method: "session/request_permission", payload: request },
-          });
-          return yield* Deferred.await(response).pipe(Effect.ensuring(Effect.sync(() => pending.delete(requestId))));
+            const runtimeRequestId = RuntimeRequestId.make(requestId);
+            yield* emit(makeAcpRequestOpenedEvent({
+              stamp,
+              provider: PROVIDER,
+              threadId: input.threadId,
+              turnId: activeContext.activeTurnId,
+              requestId: runtimeRequestId,
+              permissionRequest: parsed,
+              detail: parsed.detail ?? "omp requests permission.",
+              args: request,
+              source: "acp.jsonrpc",
+              method: "session/request_permission",
+              rawPayload: request,
+            }));
+              const answer = yield* Deferred.await(response).pipe(
+                Effect.tap((answer) =>
+                Effect.gen(function* () {
+                  yield* emit(makeAcpRequestResolvedEvent({
+                    stamp: { eventId: yield* id, createdAt: yield* now },
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId: activeContext.activeTurnId,
+                    requestId: runtimeRequestId,
+                    permissionRequest: parsed,
+                      decision: answer.decision,
+                  }));
+                }),
+              ),
+                Effect.ensuring(Effect.sync(() => pending.delete(requestId))),
+              );
+              return answer.result;
         });
       });
       const started = yield* runtime.start();
+      if (started.sessionSetupResult.configOptions) {
+        yield* options.onConfigOptionsUpdated?.(started.sessionSetupResult.configOptions) ?? Effect.void;
+      }
       const createdAt = yield* now;
       const session: ProviderSession = {
         provider: PROVIDER, providerInstanceId: options.instanceId, threadId: input.threadId,
@@ -246,14 +328,54 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
         resumeCursor: { schemaVersion: 1, sessionId: started.sessionId },
         ...(started.modelConfigId ? { model: started.modelConfigId } : {}),
       };
-      context = { threadId: input.threadId, runtime, scope, sessionId: started.sessionId, session, permissions: pending };
+        context = {
+          threadId: input.threadId,
+          runtime,
+          scope,
+          sessionId: started.sessionId,
+          session,
+          permissions: pending,
+          turns: [],
+        };
       sessions.set(input.threadId, context);
-      yield* Stream.runForEach(runtime.getEvents(), (event) => {
-        if (event._tag === "ContentDelta" || event._tag === "ToolCallUpdated" || event._tag === "UsageUpdated") {
-          return Effect.gen(function* () {
-            const update = event._tag === "ContentDelta"
-              ? { sessionUpdate: "agent_message_chunk", content: { type: "text", text: event.text } }
-              : event._tag === "UsageUpdated"
+        yield* Stream.runForEach(runtime.getEvents(), (event) => {
+          if (event._tag === "AssistantItemStarted" || event._tag === "AssistantItemCompleted") {
+            return Effect.gen(function* () {
+              yield* emit(makeAcpAssistantItemEvent({
+                stamp: { eventId: yield* id, createdAt: yield* now },
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId: context?.activeTurnId,
+                itemId: event.itemId,
+                lifecycle: event._tag === "AssistantItemStarted" ? "item.started" : "item.completed",
+              }));
+            });
+          }
+          if (event._tag === "ConfigOptionsUpdated") {
+            return options.onConfigOptionsUpdated?.(event.configOptions) ?? Effect.void;
+          }
+          if (event._tag === "AvailableCommandsUpdated") {
+            return options.onAvailableCommands?.(event.availableCommands) ?? Effect.void;
+          }
+          if (event._tag === "ConnectionTerminated") {
+            return Effect.gen(function* () {
+              const stamp = { eventId: yield* id, createdAt: yield* now };
+              yield* emit({
+                type: "session.state.changed",
+                ...stamp,
+                provider: PROVIDER,
+                threadId: input.threadId,
+                payload: { state: "error", reason: event.error.message },
+              });
+            });
+          }
+          if (event._tag === "ContentDelta" || event._tag === "ThoughtDelta" || event._tag === "ToolCallUpdated" || event._tag === "UsageUpdated") {
+            return Effect.gen(function* () {
+              const update = event._tag === "ContentDelta"
+                ? { sessionUpdate: "agent_message_chunk", content: { type: "text", text: event.text } }
+                : event._tag === "ThoughtDelta"
+                  ? { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: event.text } }
+                : event._tag === "UsageUpdated"
                 ? { sessionUpdate: "usage_update", used: event.used, size: event.size }
               : {
                   sessionUpdate: "tool_call_update",
@@ -266,6 +388,7 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
               const mapped = mapOmpSessionUpdate({
                 threadId: input.threadId,
                 ...(context?.activeTurnId ? { turnId: context.activeTurnId } : {}),
+                ...(event._tag === "ContentDelta" && event.itemId ? { itemId: event.itemId } : {}),
                 update: update as never,
                 eventId: yield* id,
                 createdAt: yield* now,
@@ -297,12 +420,14 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
         turnId,
         payload: {},
       });
-      yield* Fiber.await(prompt).pipe(
-        Effect.flatMap((exit) =>
-          Effect.gen(function* () {
-            const finishedId = yield* id;
-            const finishedAt = yield* now;
-            return Exit.match(exit, {
+        yield* Fiber.await(prompt).pipe(
+          Effect.flatMap((exit) =>
+            Effect.gen(function* () {
+              yield* context.runtime.drainEvents;
+              const finishedId = yield* id;
+              const finishedAt = yield* now;
+              context.turns.push({ id: turnId, items: [] });
+              return Exit.match(exit, {
               onSuccess: (response) =>
                 emit({
                   type: "turn.completed",
@@ -335,14 +460,20 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
       return { threadId: input.threadId, turnId, resumeCursor: context.session.resumeCursor };
     }).pipe(Effect.mapError((cause) => isProviderAdapterValidationError(cause) ? cause : error(input.threadId, "session/prompt", cause)));
 
-  const respondToRequest: Adapter["respondToRequest"] = (threadId, requestId, decision) =>
+    const respondToRequest: Adapter["respondToRequest"] = (threadId, requestId, decision) =>
     Effect.gen(function* () {
       const context = yield* requireSession(threadId);
       const pending = context.permissions.get(requestId);
       if (!pending) return yield* new ProviderAdapterRequestError({ provider: PROVIDER, method: "session/request_permission", detail: "This approval request is no longer pending." });
       const optionId = ompPermissionOptionId(pending.request.options, decision);
+      if (decision !== "cancel" && optionId === undefined) {
+        return yield* new ProviderAdapterValidationError({ provider: PROVIDER, operation: "respondToRequest", issue: "omp did not offer this permission choice." });
+      }
       const option = optionId ? { optionId } : undefined;
-      yield* Deferred.succeed(pending.response, { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } });
+        yield* Deferred.succeed(pending.response, {
+          decision,
+          result: { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } },
+        });
     });
   const interruptTurn: Adapter["interruptTurn"] = (threadId) => requireSession(threadId).pipe(Effect.flatMap((context) => context.runtime.cancel), Effect.mapError((cause) => error(threadId, "session/cancel", cause)));
   const respondToUserInput: Adapter["respondToUserInput"] = () => Effect.fail(new ProviderAdapterValidationError({ provider: PROVIDER, operation: "respondToUserInput", issue: "omp does not expose structured user questions." }));
@@ -354,7 +485,7 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
     stopAll: () => Effect.forEach([...sessions.values()], stop, { discard: true }),
     listSessions: () => Effect.succeed([...sessions.values()].map(({ session }) => session)),
     hasSession: (threadId) => Effect.succeed(sessions.has(threadId)),
-    readThread: (threadId) => requireSession(threadId).pipe(Effect.map(() => ({ threadId, turns: [] }))),
+      readThread: (threadId) => requireSession(threadId).pipe(Effect.map((context) => ({ threadId, turns: context.turns }))),
     rollbackThread: () => Effect.fail(new ProviderAdapterValidationError({ provider: PROVIDER, operation: "rollbackThread", issue: "omp does not support conversation rewind." })),
     streamEvents: Stream.fromPubSub(events),
   } satisfies Adapter;
