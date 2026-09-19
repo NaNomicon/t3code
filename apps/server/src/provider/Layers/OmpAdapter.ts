@@ -369,6 +369,9 @@ export const makeOmpAdapter = Effect.fn("makeOmpAdapter")(function* (options: Om
               });
             });
           }
+          if (event._tag === "EventStreamBarrier") {
+            return Deferred.succeed(event.acknowledge, undefined);
+          }
           if (event._tag === "ContentDelta" || event._tag === "ThoughtDelta" || event._tag === "ToolCallUpdated" || event._tag === "UsageUpdated") {
             return Effect.gen(function* () {
               const update = event._tag === "ContentDelta"
