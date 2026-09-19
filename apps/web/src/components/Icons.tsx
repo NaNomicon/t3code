@@ -781,3 +781,11 @@ export const ForgejoIcon: Icon = (props) => (
     </g>
   </svg>
 );
+
+export const OmpIcon: Icon = ({ className, ...props }) => (
+  <svg {...props} aria-hidden="true" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <text x="16" y="24" fontFamily="ui-serif, Georgia, serif" fontSize="24" fontWeight="600" textAnchor="middle" fill="currentColor">
+      π
+    </text>
+  </svg>
+);

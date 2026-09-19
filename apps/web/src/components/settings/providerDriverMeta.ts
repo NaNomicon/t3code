@@ -4,6 +4,7 @@ import {
   CodexSettings,
   CursorSettings,
   GrokSettings,
+  OmpSettings,
   OpenCodeSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
@@ -16,6 +17,7 @@ import {
   type Icon,
   OpenAI,
   OpenCodeIcon,
+  OmpIcon,
 } from "../Icons";
 
 type ProviderSettingsSchema = {
@@ -75,6 +77,12 @@ const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
     label: "OpenCode",
     icon: OpenCodeIcon,
     settingsSchema: OpenCodeSettings,
+  },
+  {
+    value: ProviderDriverKind.make("omp"),
+    label: "oh-my-pi",
+    icon: OmpIcon,
+    settingsSchema: OmpSettings,
   },
   {
     value: ProviderDriverKind.make("antigravity"),
