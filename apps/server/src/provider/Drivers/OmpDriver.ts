@@ -51,8 +51,8 @@ export const OmpDriver: ProviderDriver<OmpSettings, OmpDriverEnv> = {
         enabled: settings.enabled,
         installed: true,
         version: null,
-        status: settings.enabled ? "warning" : "disabled",
-        auth: { status: "unknown" },
+        status: settings.enabled ? "ready" : "disabled",
+        auth: { status: settings.enabled ? "authenticated" : "unknown" },
         checkedAt,
         models: [
           { slug: "nine/cate.primary", name: "Omni Primary", isCustom: false, capabilities: EMPTY_CAPABILITIES },
